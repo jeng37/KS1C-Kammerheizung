@@ -1,0 +1,915 @@
+esphome:
+  name: kammerheizung
+  friendly_name: "Kammer-Heizung"
+
+  on_boot:
+    priority: -100
+    then:
+      # ALLES AUS (hart)
+      - switch.turn_off: heater
+      - switch.turn_off: fan
+      - switch.turn_off: automatik
+      - light.turn_off: heater_led
+
+      # Moonraker Fan auf 0
+      - number.set:
+          id: air_filter_fan_speed
+          value: 0
+      - number.set:
+          id: box_fan_speed
+          value: 0
+
+      # Status / Timer / Sequenzen resetten (WLAN-Lock bleibt bestehen!)
+      - lambda: |-
+          id(fan_off_time) = 0;
+          id(prestart_active) = false;
+          id(prestart_end_time) = 0;
+          id(pending_heater_on) = false;
+
+          if (!id(wifi_lost_lock)) {
+            id(notaus_active) = false;
+            id(blocked) = false;
+          }
+
+substitutions:
+  moonraker_ip: "192.168.8.140"
+  moonraker_port: "7125"
+  firmware_version: "1.00"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: "iu321vfh2YTcH8dSedgPP9i3Igz/OJUQzUQRm0vj+6g="
+  on_client_disconnected:
+    then:
+      - switch.turn_off: heater
+      - switch.turn_off: automatik
+      - switch.turn_off: fan
+      - light.turn_off: heater_led
+
+ota:
+  - platform: esphome
+    password: "12345679"
+
+wifi:
+  ssid: !secret wifi_ssid2
+  password: !secret wifi_password2
+  fast_connect: false
+  power_save_mode: none
+  min_auth_mode: WPA
+  reboot_timeout: 5min
+
+  ap:
+    ssid: "Kammer-Heizung-Fallback"
+    password: "12345679"
+
+  on_disconnect:
+    then:
+      - script.execute: wifi_emergency_shutdown
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 3
+  auth:
+    username: admin
+    password: rootlu
+
+http_request:
+  useragent: esphome-kammerheizung
+  timeout: 5s
+  verify_ssl: false
+
+globals:
+  - id: fan_off_time
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: notaus_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: blocked
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: wifi_lost_lock
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Vorlauf-State-Machine (non-blocking)
+  - id: prestart_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: prestart_end_time
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: pending_heater_on
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: heating_allowed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: heater_cycle_on
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  - id: heater_cycle_ts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# =========================
+# I2C (ESP32 vs ESP8266!)
+#  orange GND (relay heizung - )
+#  rot 25 - D5 (relay heizung + )
+#  schwarz (relay ventilator - )
+#  weiss 26 - D6 (relay ventilator + )  
+#  Grün 3,3v bme280
+#  Bau GND  bme280
+#  Gelb 22 - D2  bme280
+#  Orange 21 - D1 bme280
+# =========================
+i2c:
+  sda: 21 # D2
+  scl: 22 # D1
+  scan: true
+
+spi:
+  clk_pin: 18
+  mosi_pin: 19
+
+
+display:
+  - platform: st7789v
+    model: "TTGO TDISPLAY 135x240"
+    cs_pin: 5
+    dc_pin: 16
+    reset_pin: 23
+    rotation: 90
+    update_interval: 2s
+    backlight_pin: false
+
+    lambda: |-
+      it.fill(Color(0, 0, 0));  // schwarz
+
+      // 🔒 WLAN-SICHERHEITSMELDUNG (HAT ABSOLUTE PRIORITÄT)
+      if (id(wifi_lost_lock)) {
+        it.printf(120, 40, id(font_title), Color(255, 0, 0),
+                  TextAlign::TOP_CENTER, "WLAN AUS!");
+        it.printf(120, 80, id(font_label), Color(255, 255, 0),
+                  TextAlign::TOP_CENTER, "SYSTEM GESPERRT");
+        it.printf(120, 120, id(font_label), Color(180, 180, 180),
+                  TextAlign::TOP_CENTER, "Manuell entsperren");
+        return;
+      }
+
+      // ===== ÜBERSCHRIFT =====
+      it.printf(120, 5, id(font_title), Color(255, 165, 0),
+                TextAlign::TOP_CENTER, "Kammer Heizung");
+
+      // ===== SOLL =====
+      it.printf(10, 50, id(font_label), Color(0, 255, 255), "Soll:");
+      it.printf(200, 50, id(font_value), Color(0, 255, 255),
+                TextAlign::TOP_RIGHT, "%.1f C", id(target_temp).state);
+
+      // ===== IST (farbig) =====
+      Color ist_color = Color(0, 255, 0);  // grün
+      if (id(chamber_temp).state < id(target_temp).state - 1.0) {
+        ist_color = Color(0, 0, 255);   // blau
+      } else if (id(chamber_temp).state > id(target_temp).state + 1.0) {
+        ist_color = Color(255, 0, 0);   // rot
+      }
+
+      it.printf(10, 90, id(font_label), ist_color, "Ist:");
+      it.printf(200, 90, id(font_big), ist_color,
+                TextAlign::TOP_RIGHT, "%.1f C", id(chamber_temp).state);
+
+font:
+  - file: "fonts/Arial.ttf"
+    id: font_title
+    size: 24
+  - file: "fonts/Arial.ttf"
+    id: font_label
+    size: 18
+  - file: "fonts/Arial.ttf"
+    id: font_value
+    size: 18
+  - file: "fonts/Arial.ttf"
+    id: font_big
+    size: 28
+
+# =========================
+# Sensoren
+# =========================
+sensor:
+  - platform: bmp280_i2c
+    address: 0x76
+    temperature:
+      name: "Kammer Temperature"
+      id: chamber_temp
+      oversampling: 16x
+    pressure:
+      name: "Kammer Pressure"
+    update_interval: 1s
+
+  - platform: template
+    name: "MMU Dryer Temperatur"
+    id: mmu_dryer_temp
+    unit_of_measurement: "°C"
+
+  - platform: template
+    name: "MMU Dryer Restzeit Sekunden"
+    id: mmu_dryer_remaining
+    unit_of_measurement: "s"
+
+# =========================
+# Relais / Schalter
+# =========================
+switch:
+  - platform: gpio
+    name: "Kammer Heizung"
+    id: heater
+    pin: 25
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: "Kammer Ventilator"
+    id: fan
+    pin: 26
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Kammer Automatik"
+    id: automatik
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          id(heating_allowed) = true;
+    turn_off_action:
+      - lambda: |-
+          id(heating_allowed) = false;
+
+  - platform: template
+    name: "Not Aus"
+    id: notaus
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - script.execute: emergency_activate
+    turn_off_action:
+      - script.execute: emergency_deactivate
+
+  - platform: template
+    name: "MMU Dryer"
+    id: mmu_dryer
+    optimistic: true
+    turn_on_action:
+      - script.execute: mmu_dryer_start_script
+    turn_off_action:
+      - script.execute: mmu_dryer_stop_script
+
+# =========================
+# Einstellwerte (Entitäten bleiben)
+# =========================
+number:
+  - platform: template
+    name: "Kammer Solltemperatur"
+    id: target_temp
+    min_value: 0
+    max_value: 65
+    step: 0.5
+    unit_of_measurement: "°C"
+    restore_value: false
+    optimistic: true
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          if (x > 0) {
+            id(heating_allowed) = true;
+          } else {
+            id(heating_allowed) = false;
+          }
+
+  - platform: template
+    name: "Ventilator Nachlaufzeit"
+    id: fan_runon_time
+    min_value: 0
+    max_value: 300
+    step: 5
+    unit_of_measurement: "s"
+    restore_value: true
+    optimistic: true
+    initial_value: 120
+
+  - platform: template
+    name: "Ventilator Vorlaufzeit"
+    id: fan_prestart_time
+    min_value: 0
+    max_value: 30
+    step: 1
+    unit_of_measurement: "s"
+    restore_value: true
+    optimistic: true
+    initial_value: 5
+
+  - platform: template
+    name: "Air Filter Fan (%)"
+    id: air_filter_fan_speed
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          float speed = x / 100.0;
+          char cmd[64];
+          snprintf(cmd, sizeof(cmd),
+                   "SET_FAN_SPEED FAN=air_filter_fan SPEED=%.2f", speed);
+          id(send_gcode).execute(cmd);
+
+  - platform: template
+    name: "Box Fan (%)"
+    id: box_fan_speed
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          float speed = x / 100.0;
+          char cmd[64];
+          snprintf(cmd, sizeof(cmd),
+                   "SET_FAN_SPEED FAN=box_fan SPEED=%.2f", speed);
+          id(send_gcode).execute(cmd);
+
+  # =========================
+  # HEIZUNG TAKTBETRIEB (ÜBERDIMENSIONIERT)
+  # =========================
+  - platform: template
+    name: "Heizung EIN-Zeit"
+    id: heater_on_time
+    min_value: 5
+    max_value: 20
+    step: 1
+    unit_of_measurement: "s"
+    restore_value: true
+    optimistic: true
+    initial_value: 10
+
+  - platform: template
+    name: "Heizung AUS-Zeit"
+    id: heater_off_time
+    min_value: 5
+    max_value: 20
+    step: 1
+    unit_of_measurement: "s"
+    restore_value: true
+    optimistic: true
+    initial_value: 5
+
+  - platform: template
+    name: "MMU Dryer Solltemperatur"
+    id: mmu_dryer_target
+    min_value: 30
+    max_value: 55
+    step: 1
+    unit_of_measurement: "°C"
+    restore_value: true
+    optimistic: true
+    initial_value: 45
+    set_action:
+      - lambda: |-
+          int temp = (int) roundf(x);
+          if (temp < 30) temp = 30;
+          if (temp > 55) temp = 55;
+
+          char buf[64];
+          snprintf(buf, sizeof(buf),
+                   "MMU_DRYER_SET_TEMP ID=0 TEMP=%d", temp);
+          id(send_gcode).execute(buf);
+          id(mmu_dryer_target).publish_state(temp);
+
+  - platform: template
+    name: "Dryer Dauer"
+    id: mmu_dryer_duration
+    min_value: 1
+    max_value: 24
+    step: 1
+    unit_of_measurement: "h"
+    restore_value: true
+    optimistic: true
+    initial_value: 8
+
+# =========================
+# Binary / Text Sensoren (Entitäten bleiben)
+# =========================
+binary_sensor:
+  - platform: template
+    name: "Heizung Aktiv"
+    lambda: |-
+      return id(heater).state;
+
+  - platform: template
+    name: "Übertemperatur"
+    id: overtemp
+    lambda: |-
+      if (!id(chamber_temp).has_state()) return false;
+      return id(chamber_temp).state > 65.0;
+    on_press:
+      - script.execute: emergency_activate
+
+  - platform: template
+    name: "Dryer Läuft"
+    id: mmu_dryer_running
+
+text_sensor:
+  - platform: template
+    name: "Kammer Heizung Firmware"
+    icon: mdi:chip
+    lambda: |-
+      return std::string("Kammerheizung FW ") + "${firmware_version}";
+        
+  - platform: wifi_info
+    ip_address:
+      name: "Kammer Heizung IP"
+    mac_address:
+      name: "Kammer Heizung MAC"  
+
+  - platform: template
+    name: "Kammer Status"
+    id: chamber_status
+    icon: mdi:alert-circle
+    lambda: |-
+      if (id(wifi_lost_lock)) {
+        return std::string("📡 WLAN weg – System gesperrt");
+      }
+      if (id(notaus_active)) {
+        return std::string("❌ NOT-AUS aktiv – Heizung AUS");
+      }
+      if (id(blocked)) {
+        return std::string("⚠️ GESPERRT – Manuelle Freigabe erforderlich");
+      }
+      if (id(overtemp).state) {
+        return std::string("❌ ÜBERTEMPERATUR – Heizung AUS");
+      }
+      if (id(heater).state) {
+        return std::string("🔥 Heizen");
+      }
+      if (id(prestart_active)) {
+        return std::string("🌀 Vorlauf");
+      }
+      if (id(fan_off_time) > 0) {
+        return std::string("🌀 Nachlauf");
+      }
+      return std::string("✅ OK – Betrieb normal");
+
+  - platform: template
+    name: "Ventilator Nachlauf"
+    id: fan_countdown
+    update_interval: 1s
+    lambda: |-
+      if (id(fan_off_time) == 0) {
+        return std::string("off");
+      }
+      int remaining = (id(fan_off_time) - millis()) / 1000;
+      if (remaining <= 0) {
+        return std::string("00:00");
+      }
+      int m = remaining / 60;
+      int s = remaining % 60;
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%02d:%02d", m, s);
+      return std::string(buf);
+
+  - platform: template
+    name: "Druck Restzeit"
+    id: druck_restzeit
+    icon: mdi:timer-sand
+    lambda: |-
+      return std::string("unknown");
+
+  - platform: template
+    name: "MMU Dryer Status"
+    id: mmu_dryer_status
+    on_value:
+      then:
+        - lambda: |-
+            if (x == "drying") {
+              if (!id(mmu_dryer).state) id(mmu_dryer).turn_on();
+            } else {
+              if (id(mmu_dryer).state) id(mmu_dryer).turn_off();
+            }
+
+  - platform: template
+    name: "MMU Dryer Restzeit"
+    id: mmu_dryer_restzeit
+    update_interval: 1s
+    lambda: |-
+      if (!id(mmu_dryer_remaining).has_state()) {
+        return std::string("00:00:00");
+      }
+      int total = (int) id(mmu_dryer_remaining).state;
+      if (total <= 0) {
+        return std::string("00:00:00");
+      }
+      int h = (total / 3600) % 24;
+      int m = (total % 3600) / 60;
+      int s = total % 60;
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+      return std::string(buf);
+
+# =========================
+# Backlight (Entity bleibt)
+# =========================
+output:
+  - platform: ledc
+    pin: 4
+    id: display_backlight
+    frequency: 1000
+
+light:
+  - platform: monochromatic
+    name: "Display Backlight"
+    id: heater_led
+    output: display_backlight
+    restore_mode: ALWAYS_OFF
+
+# =========================
+# ZENTRALE LOGIK (SICHERHEIT)
+# =========================
+interval:
+  # Steuerloop: schnell genug für Vorlauf-State-Machine, ohne zu spammen
+  - interval: 750ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+
+          // ===== SENSOR GRACE PERIOD (BOOT-FIX) =====
+          static uint32_t sensor_grace_until = 0;
+          if (sensor_grace_until == 0) {
+            sensor_grace_until = now + 3000;
+          }
+
+          const bool sensor_has_value = id(chamber_temp).has_state();
+          const bool sensor_ok = sensor_has_value || (now < sensor_grace_until);
+
+          const float temp = sensor_has_value ? id(chamber_temp).state : 0.0f;
+          const float target = id(target_temp).state;
+
+          const bool overtemp_now = sensor_has_value && (temp > 65.0);
+          const bool notaus_now = id(notaus).state || id(notaus_active);
+          const bool locked_now = id(wifi_lost_lock) || id(blocked);
+
+          auto hard_off = [&]() {
+            id(prestart_active) = false;
+            id(prestart_end_time) = 0;
+            id(pending_heater_on) = false;
+
+            if (id(heater).state) id(heater).turn_off();
+            id(heater_led).turn_off();
+          };
+
+          // ===== HARD SAFETY =====
+          if (!sensor_ok || overtemp_now || notaus_now || locked_now) {
+            if (id(heater).state && id(fan_runon_time).state > 0) {
+              if (id(fan_off_time) == 0) {
+                id(fan).turn_on();
+                id(fan_off_time) = now + (uint32_t)(id(fan_runon_time).state * 1000);
+              }
+            }
+            hard_off();
+            return;
+          }
+
+          // ===== MANUELLES HEIZ-FREIGABE-GATE =====
+          if (!id(heating_allowed)) {
+            if (id(heater).state && id(fan_runon_time).state > 0) {
+              if (id(fan_off_time) == 0) {
+                id(fan).turn_on();
+                id(fan_off_time) = now + (uint32_t)(id(fan_runon_time).state * 1000);
+              }
+            }
+            hard_off();
+            return;
+          }
+
+          // ===== TARGET == 0 → ALLES AUS =====
+          if (target <= 0.0f) {
+            if (id(heater).state && id(fan_runon_time).state > 0) {
+              if (id(fan_off_time) == 0) {
+                id(fan).turn_on();
+                id(fan_off_time) = now + (uint32_t)(id(fan_runon_time).state * 1000);
+              }
+            }
+            hard_off();
+            return;
+          }
+
+          // ===== HEIZENTSCHEIDUNG =====
+          bool want_heat = false;
+
+          const float cutoff_margin = 1.0f;
+          if (temp < target - cutoff_margin) {
+            want_heat = true;
+          }
+
+          if (id(automatik).state) {
+            if (temp <= target - 1.0f) want_heat = true;
+            if (temp >= target) want_heat = false;
+          } else {
+            want_heat = (temp < target);
+          }
+
+          // ===== HALTEMODUS =====
+          const bool in_hold_band =
+            id(automatik).state &&
+            temp >= target - 1.0f &&
+            temp <= target + 1.0f;
+
+          uint32_t on_time_ms  = (uint32_t)(id(heater_on_time).state * 1000);
+          uint32_t off_time_ms = (uint32_t)(id(heater_off_time).state * 1000);
+
+          if (in_hold_band) {
+            uint32_t sync = min(on_time_ms, off_time_ms);
+            on_time_ms = sync;
+            off_time_ms = sync;
+
+            if (temp > target) {
+              on_time_ms = (on_time_ms * 8) / 10;
+            }
+          }
+
+          // ===== TAKTBETRIEB =====
+          if (want_heat) {
+            // Heizen aktiv/angefordert -> Nachlauf aus
+            if (id(fan_off_time) != 0) {
+              id(fan_off_time) = 0;
+            }
+
+            if (!id(fan).state) id(fan).turn_on();
+
+            if (id(heater_cycle_ts) == 0) {
+              id(heater_cycle_ts) = now;
+              id(heater_cycle_on) = true;
+            }
+
+            if (id(heater_cycle_on)) {
+              if (!id(heater).state) {
+                id(heater).turn_on();
+                id(heater_led).turn_on();
+              }
+
+              if (now - id(heater_cycle_ts) >= on_time_ms) {
+                id(heater).turn_off();
+                id(heater_led).turn_off();
+                id(heater_cycle_on) = false;
+                id(heater_cycle_ts) = now;
+              }
+            } else {
+              if (now - id(heater_cycle_ts) >= off_time_ms) {
+                id(heater_cycle_on) = true;
+                id(heater_cycle_ts) = now;
+              }
+            }
+          } else {
+            id(heater).turn_off();
+            id(heater_led).turn_off();
+            id(heater_cycle_ts) = 0;
+            id(heater_cycle_on) = true;
+
+            if (id(fan_runon_time).state > 0 && id(fan_off_time) == 0) {
+              id(fan).turn_on();
+              id(fan_off_time) = now + (uint32_t)(id(fan_runon_time).state * 1000);
+            }
+          }
+
+          // ===== FAN NACHLAUF =====
+          if (id(fan_off_time) > 0 && now >= id(fan_off_time)) {
+            if (!id(heater).state) {
+              id(fan).turn_off();
+              id(fan_off_time) = 0;
+            }
+          }
+
+
+
+  # Moonraker Poll (stabil & sicher)
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - http_request.get:
+                url: "http://${moonraker_ip}:${moonraker_port}/printer/objects/query?filament_hub"
+                capture_response: true
+                max_response_buffer_size: 8192
+                on_response:
+                  then:
+                    - lambda: |-
+                        JsonDocument doc;
+                        auto err = deserializeJson(doc, body);
+                        if (err) {
+                          ESP_LOGW("mmu", "JSON error: %s", err.c_str());
+                          return;
+                        }
+
+                        JsonObject root = doc.as<JsonObject>();
+
+                        if (!root["result"]["status"]["filament_hub"].is<JsonObject>()) return;
+                        auto hub = root["result"]["status"]["filament_hub"];
+
+                        if (!hub["filament_hubs"].is<JsonArray>()) return;
+                        if (hub["filament_hubs"].size() == 0) return;
+
+                        auto hub0 = hub["filament_hubs"][0];
+
+                        id(mmu_dryer_temp).publish_state(hub0["temp"] | 0.0f);
+
+                        auto dryer = hub0["dryer_status"];
+                        const char* status = dryer["status"] | "unknown";
+                        id(mmu_dryer_status).publish_state(status);
+
+                        id(mmu_dryer_remaining).publish_state(dryer["remain_time"] | 0);
+
+                        id(mmu_dryer_running).publish_state(strcmp(status, "drying") == 0);
+
+# =========================
+# Scripts
+# =========================
+script:
+  - id: send_gcode
+    parameters:
+      gcode: string
+    then:
+      - http_request.post:
+          url: "http://${moonraker_ip}:${moonraker_port}/printer/gcode/script"
+          request_headers:
+            Content-Type: application/json
+          json:
+            script: !lambda "return gcode;"
+
+  - id: wifi_emergency_shutdown
+    mode: restart
+    then:
+      - lambda: |-
+          ESP_LOGE("wifi", "WIFI LOST → HARD SAFETY SHUTDOWN");
+          id(wifi_lost_lock) = true;
+          id(blocked) = true;
+          id(notaus_active) = true;
+          id(fan_off_time) = 0;
+          id(prestart_active) = false;
+          id(prestart_end_time) = 0;
+          id(pending_heater_on) = false;
+
+      - switch.turn_off: heater
+      - light.turn_off: heater_led
+      - switch.turn_off: fan
+      - switch.turn_off: automatik
+
+      - number.set:
+          id: target_temp
+          value: 0
+
+      - number.set:
+          id: air_filter_fan_speed
+          value: 0
+      - number.set:
+          id: box_fan_speed
+          value: 0
+
+  - id: emergency_activate
+    mode: restart
+    then:
+      - lambda: |-
+          id(blocked) = true;
+          id(notaus_active) = true;
+          id(fan_off_time) = 0;
+          id(prestart_active) = false;
+          id(prestart_end_time) = 0;
+          id(pending_heater_on) = false;
+
+      - switch.turn_off: heater
+      - light.turn_off: heater_led
+      - switch.turn_on: fan
+      - switch.turn_off: automatik
+
+      - number.set:
+          id: target_temp
+          value: 0
+
+      - number.set:
+          id: air_filter_fan_speed
+          value: 0
+      - number.set:
+          id: box_fan_speed
+          value: 0
+
+  - id: emergency_deactivate
+    mode: restart
+    then:
+      - lambda: |-
+          id(notaus_active) = false;
+          id(blocked) = false;
+          id(fan_off_time) = 0;
+          id(prestart_active) = false;
+          id(prestart_end_time) = 0;
+          id(pending_heater_on) = false;
+
+      - switch.turn_off: heater
+      - light.turn_off: heater_led
+      - switch.turn_off: fan
+
+  - id: mmu_dryer_start_script
+    then:
+      - http_request.post:
+          url: "http://${moonraker_ip}:${moonraker_port}/printer/gcode/script"
+          request_headers:
+            Content-Type: application/json
+          json:
+            script: !lambda |-
+              char buf[128];
+              int duration = (int) id(mmu_dryer_duration).state * 3600;
+              snprintf(buf, sizeof(buf),
+                       "MMU_DRYER_START ID=0 TEMP=%d DURATION=%d",
+                       (int) id(mmu_dryer_target).state, duration);
+              return std::string(buf);
+      - binary_sensor.template.publish:
+          id: mmu_dryer_running
+          state: true
+
+  - id: mmu_dryer_stop_script
+    then:
+      - http_request.post:
+          url: "http://${moonraker_ip}:${moonraker_port}/printer/gcode/script"
+          request_headers:
+            Content-Type: application/json
+          json:
+            script: "MMU_DRYER_STOP"
+      - binary_sensor.template.publish:
+          id: mmu_dryer_running
+          state: false
+
+# =========================
+# Buttons (Entitäten bleiben)
+# =========================
+button:
+  - platform: template
+    name: "System entsperren (nach WLAN-Ausfall)"
+    icon: mdi:lock-open-alert
+    on_press:
+      then:
+        - lambda: |-
+            ESP_LOGW("safety", "MANUAL UNLOCK after WiFi loss");
+            id(wifi_lost_lock) = false;
+            id(blocked) = false;
+            id(notaus_active) = false;
+            id(fan_off_time) = 0;
+            id(prestart_active) = false;
+            id(prestart_end_time) = 0;
+            id(pending_heater_on) = false;
+
+  - platform: template
+    name: "MMU Dryer Start"
+    on_press:
+      then:
+        - script.execute: mmu_dryer_start_script
+
+  - platform: template
+    name: "MMU Dryer Stop"
+    on_press:
+      then:
+        - script.execute: mmu_dryer_stop_script
+
+  - platform: restart
+    name: "Restart"

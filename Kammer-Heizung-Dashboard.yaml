@@ -1,0 +1,187 @@
+views:
+  - type: sections
+    title: Anycubic Kobre S1 Combo – Kammer Heizung
+    path: anycubic-s1-kammer
+    icon: mdi:printer-3d
+    max_columns: 3
+    subview: true
+    sections:
+      - type: grid
+        columns: 3
+        cards:
+          - type: tile
+            entity: sensor.kammer_heizung_kammer_status
+            name: Kammer Status
+          - type: tile
+            entity: binary_sensor.kammer_heizung_ubertemperatur
+            name: Übertemperatur
+            icon: mdi:alert
+            vertical: false
+            tap_action:
+              action: more-info
+            features_position: bottom
+          - type: tile
+            entity: binary_sensor.kammer_heizung_heizung_aktiv
+            name: Heizung aktiv
+            icon: mdi:radiator
+            vertical: false
+            tap_action:
+              action: more-info
+            features_position: bottom
+          - type: tile
+            entity: switch.kammer_heizung_not_aus
+            name: Not Aus
+            icon: mdi:car-brake-alert
+            color: red
+            show_entity_picture: true
+            vertical: false
+            tap_action:
+              action: toggle
+            features_position: bottom
+          - type: tile
+            entity: switch.kammer_heizung_kammer_heizung
+            name: Heizung (Relais)
+            icon: mdi:power
+            vertical: false
+            tap_action:
+              action: none
+            features_position: bottom
+          - type: tile
+            entity: switch.kammer_heizung_kammer_automatik
+            name: Automatik
+            icon: mdi:robot
+            vertical: false
+            tap_action:
+              action: toggle
+            features_position: bottom
+          - type: tile
+            entity: switch.kammer_heizung_kammer_ventilator
+            name: Kammer Ventilator
+            icon: mdi:fan
+            vertical: false
+            tap_action:
+              action: none
+            features_position: bottom
+          - type: tile
+            entity: light.kammer_heizung_display_backlight
+            name:
+              type: entity
+            vertical: false
+            tap_action:
+              action: toggle
+            features_position: bottom
+      - type: grid
+        columns: 3
+        cards:
+          - type: tile
+            entity: sensor.kammer_heizung_kammer_temperature
+            name: Kammer Temperatur
+            icon: mdi:thermometer
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.kammer_heizung_kammer_pressure
+            name: Druck
+            icon: mdi:gauge
+          - type: tile
+            entity: sensor.kammer_heizung_kammer_heizung_firmware
+            hide_state: false
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.kammer_heizung_kammer_heizung_ip
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.kammer_heizung_kammer_heizung_mac
+            vertical: false
+            features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
+          - type: entities
+            title: Solltemperatur
+            entities:
+              - entity: number.kammer_heizung_kammer_solltemperatur
+                name: Kammer Solltemperatur
+                secondary_info: none
+              - entity: button.kammer_heizung_system_entsperren_nach_wlan_ausfall
+                name: Kammer Heizung Entsperren
+            state_color: true
+      - type: grid
+        columns: 1
+        cards:
+          - type: entities
+            title: Lüfter
+            entities:
+              - entity: switch.kammer_heizung_kammer_ventilator
+                name: Heizung Ventilator
+                secondary_info: none
+              - entity: number.kammer_heizung_air_filter_fan
+                name: Air Filter Fan (%)
+                secondary_info: none
+              - entity: number.kammer_heizung_box_fan
+                name: Box Fan (%)
+                secondary_info: none
+            show_header_toggle: false
+            state_color: true
+      - type: grid
+        columns: 2
+        cards:
+          - type: picture-glance
+            camera_image: camera.webcam
+            camera_view: live
+            fit_mode: cover
+            entities: []
+          - type: tile
+            entity: camera.webcam
+            name: Snapshot
+            icon: mdi:camera
+            hide_state: true
+            tap_action:
+              action: call-service
+              service: camera.snapshot
+              target:
+                entity_id: camera.webcam
+              data:
+                filename: /config/www/snapshots/anycubic_latest.jpg
+          - type: tile
+            entity: switch.ks1c_chamber_light
+            vertical: false
+            tap_action:
+              action: toggle
+            features_position: bottom
+      - type: grid
+        cards:
+          - type: entities
+            title: Heizung Ventilator nachlaufzeit
+            entities:
+              - entity: sensor.kammer_heizung_ventilator_nachlauf
+                name: Nachlaufzeit
+              - entity: number.kammer_heizung_ventilator_nachlaufzeit
+                name: Set
+              - entity: number.kammer_heizung_heizung_ein_zeit
+                name: Heizung Ein Zeit
+              - entity: number.kammer_heizung_heizung_aus_zeit
+                name: Heizung Aus Zeit
+      - type: grid
+        cards:
+          - type: entities
+            title: ACE - Dryer
+            entities:
+              - entity: sensor.kammer_heizung_mmu_dryer_status
+                name: 'Status:'
+              - entity: switch.kammer_heizung_mmu_dryer
+                name: 'Trocknen:'
+              - entity: sensor.kammer_heizung_mmu_dryer_temperatur
+                name: 'Ist Temp:'
+              - entity: number.kammer_heizung_mmu_dryer_solltemperatur
+                name: 'Soll Temp:'
+              - entity: number.kammer_heizung_dryer_dauer
+                name: 'Dauer:'
+              - entity: sensor.kammer_heizung_mmu_dryer_restzeit
+                name: 'Rest Zeit:'
+          - type: heading
+            heading_style: title
+    header: {}
+    cards: []
