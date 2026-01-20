@@ -1,4 +1,6 @@
 # KS1C – Kammerheizung (ESPHome + Home Assistant)
+![Visitor Count](https://komarev.com/ghpvc/?username=jeng37&repo=KS1C-Kammerheizung&color=red)
+
 
 ⚠️ <span style="color:red"><strong>WICHTIG – DIY-PROJEKT!</strong></span>  
 <span style="color:red">
